@@ -4,11 +4,13 @@ import time
 import asyncio
 import queue
 from datetime import datetime
+import logging
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from telegram import Update
+import telegram
+from telegram import Update, Bot
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,6 +19,21 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+# ---------------------------
+# Logging (biar error keliatan di terminal/Cloud logs)
+# ---------------------------
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("telebot")
+
+# ---------------------------
+# Versi library (untuk diagnosa)
+# ---------------------------
+ST_VERSION = st.__version__
+PTB_VERSION = getattr(telegram, "__version__", "unknown")
 
 # ---------------------------
 # Load secrets (Streamlit Cloud -> st.secrets, Lokal -> .env)
@@ -32,7 +49,7 @@ if ALLOWED_CHAT_ID is None:
     ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 
 # Normalisasi tipe
-if isinstance(ALLOWED_CHAT_ID, str) and ALLOWED_CHAT_ID.isdigit():
+if isinstance(ALLOWED_CHAT_ID, str) and ALLOWED_CHAT_ID.strip().isdigit():
     ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID)
 elif isinstance(ALLOWED_CHAT_ID, (int, type(None))):
     pass
@@ -50,6 +67,8 @@ if "bot_thread" not in st.session_state:
     st.session_state.bot_thread = None
 if "app" not in st.session_state:
     st.session_state.app = None
+if "bot_error" not in st.session_state:
+    st.session_state.bot_error = None
 
 # Queue untuk kirim data dari thread bot -> UI
 if "incoming_queue" not in st.session_state:
@@ -73,13 +92,16 @@ def allowed(chat_id: int) -> bool:
 
 def enqueue_incoming(chat_id: int, name: str, text: str):
     """Masukkan pesan masuk ke queue (dari thread bot)."""
-    st.session_state.incoming_queue.put({
-        "ts": time.time(),
-        "chat_id": chat_id,
-        "name": name or str(chat_id),
-        "text": text or "",
-        "direction": "in",
-    })
+    try:
+        st.session_state.incoming_queue.put({
+            "ts": time.time(),
+            "chat_id": chat_id,
+            "name": name or str(chat_id),
+            "text": text or "",
+            "direction": "in",
+        })
+    except Exception as e:
+        logger.exception("Gagal enqueue incoming: %s", e)
 
 def add_outgoing(chat_id: int, name: str, text: str):
     """Append pesan keluar ke log (dipanggil di UI thread)."""
@@ -104,6 +126,12 @@ def drain_queue_to_log() -> int:
             st.session_state.messages.append(evt)
         moved += 1
     return moved
+
+async def test_token(token: str) -> str:
+    """Cek token ke Telegram getMe(). Return username kalau OK, raise kalau error."""
+    bot = Bot(token=token)
+    me = await bot.get_me()
+    return f"@{me.username}" if me.username else str(me.id)
 
 # ---------------------------
 # Telegram Handlers
@@ -143,37 +171,56 @@ async def nontext_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not allowed(chat.id):
         return
     kind = "non-text"
-    if update.message.photo:
-        kind = "photo"
-    elif update.message.sticker:
-        kind = "sticker"
-    elif update.message.document:
-        kind = "document"
-    elif update.message.audio:
-        kind = "audio"
-    elif update.message.video:
-        kind = "video"
+    msg = update.message
+    if msg:
+        if msg.photo:
+            kind = "photo"
+        elif msg.sticker:
+            kind = "sticker"
+        elif msg.document:
+            kind = "document"
+        elif msg.audio:
+            kind = "audio"
+        elif msg.video:
+            kind = "video"
     enqueue_incoming(chat.id, user.full_name if user else str(chat.id), f"[{kind} message]")
-    # Opsional balasan ringan
-    await update.message.reply_text(f"Diterima {kind} 👍")
+    try:
+        await update.message.reply_text(f"Diterima {kind} 👍")
+    except Exception:
+        pass
 
 def run_bot_polling():
     """Jalankan bot dengan polling di thread terpisah."""
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    st.session_state.app = app
+    try:
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        st.session_state.app = app
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
-    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, nontext_msg))
+        app.add_handler(CommandHandler("start", start_cmd))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+        app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, nontext_msg))
 
-    # Disable default signal handling karena berjalan di thread
-    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
+        # Biarkan allowed_updates default (lebih aman lintas versi)
+        app.run_polling(stop_signals=None)
+    except Exception as e:
+        logger.exception("Polling crash: %s", e)
+        # Simpan error untuk ditampilkan di UI
+        st.session_state.bot_error = repr(e)
+        st.session_state.bot_started = False
 
 # ---------------------------
 # UI
 # ---------------------------
 st.title("Telegram Bot x Streamlit 🤖")
+
+with st.expander("Diagnostik & Konfigurasi", expanded=False):
+    st.write(f"- **Streamlit**: `{ST_VERSION}`")
+    st.write(f"- **python-telegram-bot**: `{PTB_VERSION}`")
+    st.write(
+        "- **Mode**: Polling (cocok untuk prototyping & Streamlit Cloud)\n"
+        "- **ALLOWED_CHAT_ID**: "
+        + (str(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else "tidak dibatasi (hati-hati untuk bot publik)")
+    )
 
 # Validasi token
 if not TELEGRAM_TOKEN:
@@ -183,34 +230,57 @@ if not TELEGRAM_TOKEN:
     )
     st.stop()
 
-with st.expander("Konfigurasi", expanded=False):
-    st.write(
-        "- **Mode**: Polling (cocok untuk prototyping & Streamlit Cloud)\n"
-        "- **ALLOWED_CHAT_ID**: "
-        + (str(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else "tidak dibatasi (hati-hati untuk bot publik)")
-    )
+# Tes token (getMe) tombol opsional
+colx1, colx2 = st.columns(2)
+with colx1:
+    if st.button("🔎 Tes Koneksi (getMe)"):
+        async def _t():
+            uname = await test_token(TELEGRAM_TOKEN)
+            return uname
+        try:
+            uname = asyncio.run(_t())
+            st.success(f"Token valid. Bot: {uname}")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            uname = loop.run_until_complete(test_token(TELEGRAM_TOKEN))
+            st.success(f"Token valid. Bot: {uname}")
+        except Exception as e:
+            st.error(f"Gagal getMe: {e}")
+
+with colx2:
+    if st.session_state.bot_error:
+        st.warning(f"Kesalahan terakhir: {st.session_state.bot_error}")
 
 # Kontrol start/stop bot
 col1, col2 = st.columns(2)
 with col1:
     if not st.session_state.bot_started:
         if st.button("▶️ Start Bot"):
+            st.session_state.bot_error = None
             t = threading.Thread(target=run_bot_polling, daemon=True)
             t.start()
             time.sleep(1.0)  # beri waktu inisialisasi
             st.session_state.bot_thread = t
-            st.session_state.bot_started = True
-            st.success("Bot dimulai (polling).")
+            # Cek apakah app terbuat
+            if st.session_state.app is None:
+                st.error("Gagal memulai bot (app tidak terinisialisasi). Cek token & jaringan.")
+            else:
+                st.session_state.bot_started = True
+                st.success("Bot dimulai (polling).")
     else:
         st.info("Bot sedang berjalan (polling).")
 
 with col2:
     if st.session_state.bot_started:
         if st.button("⏹ Stop Bot"):
-            if st.session_state.app:
-                st.session_state.app.stop()
-            st.session_state.bot_started = False
-            st.success("Bot dihentikan.")
+            try:
+                if st.session_state.app:
+                    st.session_state.app.stop()
+                st.session_state.bot_started = False
+                st.success("Bot dihentikan.")
+            except Exception as e:
+                st.error(f"Gagal stop: {e}")
         else:
             st.caption("Gunakan tombol ini untuk stop.")
 
@@ -221,7 +291,7 @@ st.divider()
 # ===========================
 st.subheader("Live Chat Log")
 
-# Auto-refresh: pakai st.autorefresh jika tersedia; jika tidak, fallback dengan st.rerun() via checkbox
+# Auto-refresh: pakai st.autorefresh jika tersedia; jika tidak, fallback dengan st.rerun()
 _autorefresh_enabled = False
 try:
     st.autorefresh(interval=2000, key="chat_refresh")  # 2 detik
@@ -230,7 +300,6 @@ except Exception:
     pass
 
 if not _autorefresh_enabled:
-    st.caption("Autorefresh native tidak tersedia. Aktifkan fallback bila perlu.")
     if "last_refresh" not in st.session_state:
         st.session_state.last_refresh = time.time()
     enable_fallback = st.checkbox("Auto-refresh (fallback) tiap 2 detik", value=False)
@@ -274,11 +343,11 @@ with colA:
     target_chat_ids_raw = st.text_area(
         "Chat ID tujuan (boleh multiple, pisahkan koma/enter). Kosongkan untuk ALLOWED_CHAT_ID.",
         value=default_chat,
-        height=80,
+        height=90,
         help="Gunakan @userinfobot untuk mengetahui chat ID. Contoh: 11111,22222"
     )
 with colB:
-    msg = st.text_area("Pesan", placeholder="Tulis pesan...", height=80)
+    msg = st.text_area("Pesan", placeholder="Tulis pesan...", height=90)
 
 def parse_chat_ids(raw: str):
     parts = [p.strip() for p in (raw or "").replace("\n", ",").split(",")]
@@ -303,15 +372,20 @@ if st.button("📤 Kirim / Broadcast"):
             async def _broadcast():
                 tasks = [st.session_state.app.bot.send_message(chat_id=cid, text=msg) for cid in chat_ids]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                sent = 0
                 for cid, res in zip(chat_ids, results):
                     if isinstance(res, Exception):
-                        # Kamu bisa tampilkan error per CID kalau mau
+                        logger.warning("Gagal kirim ke %s: %s", cid, res)
                         continue
                     add_outgoing(cid, "Me", msg)
+                    sent += 1
+                return sent
 
             try:
-                asyncio.run(_broadcast())
-                st.success(f"Pesan terkirim ke {len(chat_ids)} chat ✅")
+                count = asyncio.run(_broadcast())
+                st.success(f"Pesan terkirim ke {count}/{len(chat_ids)} chat ✅")
             except RuntimeError:
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(_broadcast())
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                count = loop.run_until_complete(_broadcast())
+                st.success(f"Pesan terkirim ke {count}/{len(chat_ids)} chat ✅")
