@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 
 # ---------------------------
-# Logging (biar error keliatan di terminal/Cloud logs)
+# Logging
 # ---------------------------
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -29,14 +29,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telebot")
 
-# ---------------------------
-# Versi library (untuk diagnosa)
-# ---------------------------
+# Versi lib (diagnostik)
 ST_VERSION = st.__version__
 PTB_VERSION = getattr(telegram, "__version__", "unknown")
 
 # ---------------------------
-# Load secrets (Streamlit Cloud -> st.secrets, Lokal -> .env)
+# Load secrets
 # ---------------------------
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", None)
 ALLOWED_CHAT_ID = st.secrets.get("ALLOWED_CHAT_ID", None)
@@ -63,35 +61,31 @@ st.set_page_config(page_title="Telegram Bot x Streamlit", page_icon="🤖")
 
 if "bot_started" not in st.session_state:
     st.session_state.bot_started = False
-if "bot_thread" not in st.session_state:
-    st.session_state.bot_thread = None
-if "app" not in st.session_state:
-    st.session_state.app = None
 if "bot_error" not in st.session_state:
     st.session_state.bot_error = None
-
-# Queue untuk kirim data dari thread bot -> UI
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "msg_lock" not in st.session_state:
+    st.session_state.msg_lock = threading.Lock()
 if "incoming_queue" not in st.session_state:
     st.session_state.incoming_queue = queue.Queue()
 
-# Log pesan (in/out). Item: {ts, chat_id, name, text, direction}
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "msg_lock" not in st.session_state:
-    st.session_state.msg_lock = threading.Lock()
+# ---------------------------
+# Global holder (aman diakses dari thread)
+# ---------------------------
+APP_REF = {"app": None}                 # Application instance
+APP_READY = threading.Event()           # Diset saat app berhasil dibuat
+STOP_REQUESTED = threading.Event()      # Untuk stop manual
 
 # ---------------------------
-# Util
+# Utils
 # ---------------------------
 def allowed(chat_id: int) -> bool:
-    """Batasi inbound jika ALLOWED_CHAT_ID diset."""
     if ALLOWED_CHAT_ID is None:
         return True
     return chat_id == ALLOWED_CHAT_ID
 
 def enqueue_incoming(chat_id: int, name: str, text: str):
-    """Masukkan pesan masuk ke queue (dari thread bot)."""
     try:
         st.session_state.incoming_queue.put({
             "ts": time.time(),
@@ -104,7 +98,6 @@ def enqueue_incoming(chat_id: int, name: str, text: str):
         logger.exception("Gagal enqueue incoming: %s", e)
 
 def add_outgoing(chat_id: int, name: str, text: str):
-    """Append pesan keluar ke log (dipanggil di UI thread)."""
     with st.session_state.msg_lock:
         st.session_state.messages.append({
             "ts": time.time(),
@@ -115,7 +108,6 @@ def add_outgoing(chat_id: int, name: str, text: str):
         })
 
 def drain_queue_to_log() -> int:
-    """Pindahkan event dari queue ke log sebelum render UI."""
     moved = 0
     while not st.session_state.incoming_queue.empty():
         try:
@@ -128,7 +120,6 @@ def drain_queue_to_log() -> int:
     return moved
 
 async def test_token(token: str) -> str:
-    """Cek token ke Telegram getMe(). Return username kalau OK, raise kalau error."""
     bot = Bot(token=token)
     me = await bot.get_me()
     return f"@{me.username}" if me.username else str(me.id)
@@ -159,13 +150,11 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text or ""
     enqueue_incoming(chat.id, user.full_name if user else str(chat.id), text)
-    # Balas contoh (opsional)
     await update.message.reply_text(
         f"Kamu bilang:\n\n<code>{text}</code>", parse_mode=ParseMode.HTML
     )
 
 async def nontext_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tangani pesan non-text (foto, stiker, dsb) agar tetap muncul di log."""
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not allowed(chat.id):
@@ -189,24 +178,30 @@ async def nontext_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+# ---------------------------
+# Bot thread
+# ---------------------------
 def run_bot_polling():
-    """Jalankan bot dengan polling di thread terpisah."""
+    """Bangun Application dan jalankan polling (di thread terpisah)."""
     try:
+        STOP_REQUESTED.clear()
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        st.session_state.app = app
+        # simpan ke global holder (bukan session_state)
+        APP_REF["app"] = app
+        APP_READY.set()
 
         app.add_handler(CommandHandler("start", start_cmd))
         app.add_handler(CommandHandler("help", help_cmd))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
         app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, nontext_msg))
 
-        # Biarkan allowed_updates default (lebih aman lintas versi)
+        # Jalan blocking; stop_signals=None agar tidak mengganggu Streamlit
         app.run_polling(stop_signals=None)
     except Exception as e:
         logger.exception("Polling crash: %s", e)
-        # Simpan error untuk ditampilkan di UI
         st.session_state.bot_error = repr(e)
-        st.session_state.bot_started = False
+        APP_REF["app"] = None
+        APP_READY.clear()
 
 # ---------------------------
 # UI
@@ -230,13 +225,12 @@ if not TELEGRAM_TOKEN:
     )
     st.stop()
 
-# Tes token (getMe) tombol opsional
+# Test token
 colx1, colx2 = st.columns(2)
 with colx1:
     if st.button("🔎 Tes Koneksi (getMe)"):
         async def _t():
-            uname = await test_token(TELEGRAM_TOKEN)
-            return uname
+            return await test_token(TELEGRAM_TOKEN)
         try:
             uname = asyncio.run(_t())
             st.success(f"Token valid. Bot: {uname}")
@@ -252,19 +246,29 @@ with colx2:
     if st.session_state.bot_error:
         st.warning(f"Kesalahan terakhir: {st.session_state.bot_error}")
 
-# Kontrol start/stop bot
+# Kontrol Start / Stop
 col1, col2 = st.columns(2)
 with col1:
     if not st.session_state.bot_started:
         if st.button("▶️ Start Bot"):
+            # reset flag siap
             st.session_state.bot_error = None
+            APP_READY.clear()
+            APP_REF["app"] = None
+
             t = threading.Thread(target=run_bot_polling, daemon=True)
             t.start()
-            time.sleep(1.0)  # beri waktu inisialisasi
-            st.session_state.bot_thread = t
-            # Cek apakah app terbuat
-            if st.session_state.app is None:
-                st.error("Gagal memulai bot (app tidak terinisialisasi). Cek token & jaringan.")
+
+            # Tunggu sampai app siap (maks 3 detik)
+            waited = 0
+            while waited < 30:  # 30 x 0.1s = 3 detik
+                if APP_READY.is_set() and APP_REF["app"] is not None:
+                    break
+                time.sleep(0.1)
+                waited += 1
+
+            if not APP_READY.is_set() or APP_REF["app"] is None:
+                st.error("Gagal memulai bot (app tidak terinisialisasi). Cek token & jaringan/log.")
             else:
                 st.session_state.bot_started = True
                 st.success("Bot dimulai (polling).")
@@ -275,9 +279,12 @@ with col2:
     if st.session_state.bot_started:
         if st.button("⏹ Stop Bot"):
             try:
-                if st.session_state.app:
-                    st.session_state.app.stop()
+                app = APP_REF.get("app")
+                if app is not None:
+                    app.stop()
                 st.session_state.bot_started = False
+                APP_REF["app"] = None
+                APP_READY.clear()
                 st.success("Bot dihentikan.")
             except Exception as e:
                 st.error(f"Gagal stop: {e}")
@@ -291,7 +298,7 @@ st.divider()
 # ===========================
 st.subheader("Live Chat Log")
 
-# Auto-refresh: pakai st.autorefresh jika tersedia; jika tidak, fallback dengan st.rerun()
+# Autorefresh
 _autorefresh_enabled = False
 try:
     st.autorefresh(interval=2000, key="chat_refresh")  # 2 detik
@@ -307,7 +314,7 @@ if not _autorefresh_enabled:
         st.session_state.last_refresh = time.time()
         st.rerun()
 
-# Drain queue ke log sebelum render
+# Pindahkan pesan dari queue ke log
 new_count = drain_queue_to_log()
 
 cols = st.columns([1, 1, 3])
@@ -317,7 +324,7 @@ with cols[0]:
 with cols[1]:
     st.write(f"Baru masuk: **{new_count}**")
 
-# Tampilkan pesan (batasi 200 terakhir agar ringan)
+# Render pesan (maks 200 terakhir)
 MAX_SHOW = 200
 msgs = st.session_state.messages[-MAX_SHOW:]
 
@@ -328,12 +335,12 @@ for m in msgs:
     with st.chat_message(role, avatar=avatar):
         st.markdown(f"**{header}**\n\n{m['text']}")
 
-st.caption("Log saat ini in-memory. Untuk histori permanen, simpan ke DB (SQLite/Firestore) sesuai kebutuhan.")
+st.caption("Log saat ini in-memory. Untuk histori permanen, simpan ke DB (SQLite/Firestore).")
 
 st.divider()
 
 # ===========================
-# Kirim Pesan dari Streamlit (single / broadcast)
+# Kirim / Broadcast ke Telegram
 # ===========================
 st.subheader("Kirim / Broadcast ke Telegram")
 
@@ -360,7 +367,8 @@ def parse_chat_ids(raw: str):
     return sorted(list(set(ids)))
 
 if st.button("📤 Kirim / Broadcast"):
-    if not st.session_state.app:
+    app = APP_REF.get("app")
+    if app is None:
         st.warning("Bot belum berjalan.")
     else:
         chat_ids = parse_chat_ids(target_chat_ids_raw)
@@ -370,7 +378,7 @@ if st.button("📤 Kirim / Broadcast"):
             st.error("Pesan kosong.")
         else:
             async def _broadcast():
-                tasks = [st.session_state.app.bot.send_message(chat_id=cid, text=msg) for cid in chat_ids]
+                tasks = [app.bot.send_message(chat_id=cid, text=msg) for cid in chat_ids]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 sent = 0
                 for cid, res in zip(chat_ids, results):
