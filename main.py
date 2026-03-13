@@ -19,12 +19,11 @@ from telegram.ext import (
 )
 
 # ---------------------------
-# Load secrets (Streamlit or .env)
+# Load secrets (Streamlit Cloud -> st.secrets, Lokal -> .env)
 # ---------------------------
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", None)
 ALLOWED_CHAT_ID = st.secrets.get("ALLOWED_CHAT_ID", None)
 
-# Fallback ke .env jika dijalankan lokal
 if TELEGRAM_TOKEN is None:
     load_dotenv()
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -41,7 +40,7 @@ else:
     ALLOWED_CHAT_ID = None
 
 # ---------------------------
-# Streamlit state
+# Streamlit setup & state
 # ---------------------------
 st.set_page_config(page_title="Telegram Bot x Streamlit", page_icon="🤖")
 
@@ -52,15 +51,14 @@ if "bot_thread" not in st.session_state:
 if "app" not in st.session_state:
     st.session_state.app = None
 
-# Queue untuk komunikasi thread-safe dari handler (thread bot) ke UI Streamlit
+# Queue untuk kirim data dari thread bot -> UI
 if "incoming_queue" not in st.session_state:
     st.session_state.incoming_queue = queue.Queue()
 
-# List log pesan (in/out). Setiap item: dict {ts, chat_id, name, text, direction}
+# Log pesan (in/out). Item: {ts, chat_id, name, text, direction}
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Lock opsional kalau mau jaga konsistensi saat append (di sini cukup aman karena append sederhana)
 if "msg_lock" not in st.session_state:
     st.session_state.msg_lock = threading.Lock()
 
@@ -68,16 +66,13 @@ if "msg_lock" not in st.session_state:
 # Util
 # ---------------------------
 def allowed(chat_id: int) -> bool:
-    """Batasi siapa yang boleh interaksi (inbound) jika ALLOWED_CHAT_ID diset."""
+    """Batasi inbound jika ALLOWED_CHAT_ID diset."""
     if ALLOWED_CHAT_ID is None:
         return True
     return chat_id == ALLOWED_CHAT_ID
 
-def now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 def enqueue_incoming(chat_id: int, name: str, text: str):
-    """Masukkan pesan masuk ke queue (diproses di thread UI)."""
+    """Masukkan pesan masuk ke queue (dari thread bot)."""
     st.session_state.incoming_queue.put({
         "ts": time.time(),
         "chat_id": chat_id,
@@ -87,7 +82,7 @@ def enqueue_incoming(chat_id: int, name: str, text: str):
     })
 
 def add_outgoing(chat_id: int, name: str, text: str):
-    """Langsung append pesan keluar ke log (dipanggil dari thread UI setelah kirim)."""
+    """Append pesan keluar ke log (dipanggil di UI thread)."""
     with st.session_state.msg_lock:
         st.session_state.messages.append({
             "ts": time.time(),
@@ -97,8 +92,8 @@ def add_outgoing(chat_id: int, name: str, text: str):
             "direction": "out",
         })
 
-def drain_queue_to_log():
-    """Pindahkan semua event dari queue ke log untuk ditampilkan."""
+def drain_queue_to_log() -> int:
+    """Pindahkan event dari queue ke log sebelum render UI."""
     moved = 0
     while not st.session_state.incoming_queue.empty():
         try:
@@ -127,7 +122,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enqueue_incoming(chat.id, user.full_name if user else str(chat.id), "/help")
         await update.message.reply_text("/start - cek bot\n/help - bantuan")
 
-async def echo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     chat = update.effective_chat
@@ -135,12 +130,32 @@ async def echo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not allowed(chat.id):
         return
     text = update.message.text or ""
-    # Masukkan pesan inbound ke queue (biar UI Streamlit bisa tampilkan)
     enqueue_incoming(chat.id, user.full_name if user else str(chat.id), text)
-    # Balasan contoh (opsional)
+    # Balas contoh (opsional)
     await update.message.reply_text(
         f"Kamu bilang:\n\n<code>{text}</code>", parse_mode=ParseMode.HTML
     )
+
+async def nontext_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tangani pesan non-text (foto, stiker, dsb) agar tetap muncul di log."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not allowed(chat.id):
+        return
+    kind = "non-text"
+    if update.message.photo:
+        kind = "photo"
+    elif update.message.sticker:
+        kind = "sticker"
+    elif update.message.document:
+        kind = "document"
+    elif update.message.audio:
+        kind = "audio"
+    elif update.message.video:
+        kind = "video"
+    enqueue_incoming(chat.id, user.full_name if user else str(chat.id), f"[{kind} message]")
+    # Opsional balasan ringan
+    await update.message.reply_text(f"Diterima {kind} 👍")
 
 def run_bot_polling():
     """Jalankan bot dengan polling di thread terpisah."""
@@ -149,9 +164,10 @@ def run_bot_polling():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_msg))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, nontext_msg))
 
-    # Disable default signal handling karena kita ada di thread
+    # Disable default signal handling karena berjalan di thread
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
 
 # ---------------------------
@@ -171,7 +187,7 @@ with st.expander("Konfigurasi", expanded=False):
     st.write(
         "- **Mode**: Polling (cocok untuk prototyping & Streamlit Cloud)\n"
         "- **ALLOWED_CHAT_ID**: "
-        + (str(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else "tidak dibatasi (hati-hati di bot publik)")
+        + (str(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else "tidak dibatasi (hati-hati untuk bot publik)")
     )
 
 # Kontrol start/stop bot
@@ -201,24 +217,30 @@ with col2:
 st.divider()
 
 # ===========================
-# Panel Chat: Tampilkan pesan masuk/keluar
+# Live Chat Log (Telegram -> Streamlit)
 # ===========================
 st.subheader("Live Chat Log")
 
-# Auto-refresh ringan agar log bergerak saat ada pesan baru
-st_autorefresh = st.experimental_rerun  # fallback nama, kita pakai st.autorefresh kalau ada
+# Auto-refresh: pakai st.autorefresh jika tersedia; jika tidak, fallback dengan st.rerun() via checkbox
+_autorefresh_enabled = False
 try:
-    # Streamlit >= 1.18 punya st.autorefresh
-    from streamlit.runtime.scriptrunner import add_script_run_ctx  # just to ensure runtime available
-    _ = st.autorefresh(interval=2000, key="chat_refresh")  # 2 detik
+    st.autorefresh(interval=2000, key="chat_refresh")  # 2 detik
+    _autorefresh_enabled = True
 except Exception:
-    # Jika tidak ada, kita tidak paksa (user bisa klik rerun manual)
     pass
+
+if not _autorefresh_enabled:
+    st.caption("Autorefresh native tidak tersedia. Aktifkan fallback bila perlu.")
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = time.time()
+    enable_fallback = st.checkbox("Auto-refresh (fallback) tiap 2 detik", value=False)
+    if enable_fallback and (time.time() - st.session_state.last_refresh > 2):
+        st.session_state.last_refresh = time.time()
+        st.rerun()
 
 # Drain queue ke log sebelum render
 new_count = drain_queue_to_log()
 
-# Tombol bersihkan log
 cols = st.columns([1, 1, 3])
 with cols[0]:
     if st.button("🧹 Clear Log"):
@@ -226,8 +248,7 @@ with cols[0]:
 with cols[1]:
     st.write(f"Baru masuk: **{new_count}**")
 
-# Tampilkan chat dengan gaya chat_message
-# Batasi tampilan terakhir N pesan agar ringan
+# Tampilkan pesan (batasi 200 terakhir agar ringan)
 MAX_SHOW = 200
 msgs = st.session_state.messages[-MAX_SHOW:]
 
@@ -238,14 +259,14 @@ for m in msgs:
     with st.chat_message(role, avatar=avatar):
         st.markdown(f"**{header}**\n\n{m['text']}")
 
-st.caption("Catatan: Log ini hanya in-memory. Untuk persist, simpan ke DB (SQLite/Firestore) sesuai kebutuhan.")
+st.caption("Log saat ini in-memory. Untuk histori permanen, simpan ke DB (SQLite/Firestore) sesuai kebutuhan.")
 
 st.divider()
 
 # ===========================
-# Kirim pesan dari Streamlit (single / broadcast)
+# Kirim Pesan dari Streamlit (single / broadcast)
 # ===========================
-st.subheader("Kirim Pesan ke Telegram")
+st.subheader("Kirim / Broadcast ke Telegram")
 
 colA, colB = st.columns(2)
 with colA:
@@ -265,10 +286,8 @@ def parse_chat_ids(raw: str):
     for p in parts:
         if p.isdigit():
             ids.append(int(p))
-    # fallback ke ALLOWED_CHAT_ID jika kosong
     if not ids and ALLOWED_CHAT_ID:
         ids = [ALLOWED_CHAT_ID]
-    # unique
     return sorted(list(set(ids)))
 
 if st.button("📤 Kirim / Broadcast"):
@@ -282,16 +301,12 @@ if st.button("📤 Kirim / Broadcast"):
             st.error("Pesan kosong.")
         else:
             async def _broadcast():
-                tasks = []
-                for cid in chat_ids:
-                    tasks.append(st.session_state.app.bot.send_message(chat_id=cid, text=msg))
+                tasks = [st.session_state.app.bot.send_message(chat_id=cid, text=msg) for cid in chat_ids]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                # Tambahkan ke log untuk setiap pengiriman yang berhasil
                 for cid, res in zip(chat_ids, results):
                     if isinstance(res, Exception):
-                        # Bisa tampilkan error per chat id kalau mau
+                        # Kamu bisa tampilkan error per CID kalau mau
                         continue
-                    # Kita tidak tahu nama dari Streamlit sisi outbound; simpan sebagai 'Me'
                     add_outgoing(cid, "Me", msg)
 
             try:
